@@ -1,8 +1,10 @@
+import * as NodeServices from "@effect/platform-node/NodeServices";
 import { assert, it } from "@effect/vitest";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as SqlClient from "effect/sql/SqlClient";
 
+import * as ServerConfig from "../config.ts";
 import * as EventStore from "../orchestration-v2/EventStore.ts";
 import * as ProjectionMaintenance from "../orchestration-v2/ProjectionMaintenance.ts";
 import * as ProjectionStore from "../orchestration-v2/ProjectionStore.ts";
@@ -37,6 +39,8 @@ it.effect("a new database returns freed pages online without losing data", () =>
         Layer.provide(ProjectionMaintenance.layer),
         Layer.provide(Layer.merge(EventStore.layer, ProjectionStore.layer)),
         Layer.provideMerge(Sqlite.layerMemory),
+        Layer.provide(ServerConfig.layerTest(process.cwd(), { prefix: "database-storage-" })),
+        Layer.provide(NodeServices.layer),
       ),
     ),
   ),
