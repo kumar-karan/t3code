@@ -74,21 +74,38 @@ const readStats = (host: string, number = 7) =>
 const stats = { additions: 3, deletions: 1 };
 
 describe("GitHubGraphQlAuth", () => {
-  it.effect("sends each host's request to its own endpoint with its token", () => {
-    const { layer, requests } = harness(() =>
-      json({ data: { _0_repository: { pullRequest: stats } } }),
-    );
-    return Effect.gen(function* () {
-      yield* readStats("github.com");
-      yield* readStats("github.acme.test");
-      expect(requests.map((request) => request.url)).toEqual([
-        "https://api.github.com/graphql",
-        "https://github.acme.test/api/graphql",
-      ]);
-      expect(requests[0]?.headers["authorization"]).toBe("Bearer secret");
-      expect(requests[0]?.headers["x-github-api-version"]).toBe("2022-11-28");
-    }).pipe(Effect.provide(layer));
-  });
+  it.effect(
+    "sends each host's lookups to its own endpoint with its token, never in one batch",
+    () => {
+      const { layer, requests } = harness(() =>
+        json({ data: { _0_repository: { pullRequest: stats } } }),
+      );
+      return Effect.gen(function* () {
+        const client = yield* GraphQLClient.make(
+          PullRequestBatchesGraphQLGroup.middleware(GitHubGraphQlClient.GitHubGraphQlAuth),
+        ).pipe(Effect.provide(GitHubGraphQlClient.layer));
+        const resolver = GraphQLResolver.aliased(client.PullRequestStats, {
+          batchKey: GitHubGraphQlClient.batchKey,
+        });
+        const lookup = (host: string) =>
+          GraphQLResolver.request({ owner: "acme", name: "web", number: 7 }, resolver).pipe(
+            Effect.provideService(GitHubGraphQlClient.GitHubGraphQlTarget, {
+              host,
+              operation: "stats",
+            }),
+          );
+        yield* Effect.all([lookup("github.com"), lookup("github.acme.test")], {
+          concurrency: "unbounded",
+        });
+        expect(requests.map((request) => request.url).toSorted()).toEqual([
+          "https://api.github.com/graphql",
+          "https://github.acme.test/api/graphql",
+        ]);
+        expect(requests[0]?.headers["authorization"]).toBe("Bearer secret");
+        expect(requests[0]?.headers["x-github-api-version"]).toBe("2022-11-28");
+      }).pipe(Effect.provide(layer));
+    },
+  );
 
   it.effect("pauses the host on a RATE_LIMITED answer sent with HTTP 200", () => {
     const reset = Math.floor(NOW / 1000) + 600;

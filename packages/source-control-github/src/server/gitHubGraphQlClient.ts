@@ -4,7 +4,7 @@ import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as Redacted from "effect/Redacted";
 import * as Stream from "effect/Stream";
-import { HttpClient, HttpClientError, HttpClientRequest } from "effect/http";
+import { HttpClient, HttpClientError } from "effect/http";
 import * as Headers from "effect/http/Headers";
 import { GraphQLClientError, GraphQLMiddleware, GraphQLProtocol } from "effect/graphql";
 import { SourceControlProviderKind } from "@t3tools/contracts";
@@ -26,15 +26,6 @@ export class GitHubGraphQlTarget extends Context.Service<
     readonly allowReserve?: boolean | undefined;
   }
 >()("@t3tools/source-control-github/server/gitHubGraphQlClient/GitHubGraphQlTarget") {}
-
-/**
- * The GraphQL endpoint the request in flight is sent to. `GitHubGraphQlAuth` sets it for `next`,
- * because `GraphQLProtocol.layerHttp` takes one URL and one client serves every GitHub host.
- */
-const GraphQlEndpoint = Context.Reference<string | null>(
-  "@t3tools/source-control-github/server/gitHubGraphQlClient/GraphQlEndpoint",
-  { defaultValue: () => null },
-);
 
 /**
  * GitHub's auth and rate limits around a generated GraphQL call: the host's token, the quota
@@ -88,7 +79,6 @@ export class GitHubGraphQlAuth extends GraphQLMiddleware.Service<
                   authorization: `Bearer ${Redacted.value(token)}`,
                 }),
               }).pipe(
-                Effect.provideService(GraphQlEndpoint, GitHubApi.gitHubApiUrls(host).graphql),
                 Effect.timeout(GitHubApi.DEFAULT_TIMEOUT),
                 Effect.catchTags({
                   TimeoutError: (cause) =>
@@ -198,26 +188,23 @@ export class GitHubGraphQlAuth extends GraphQLMiddleware.Service<
 }
 
 /**
- * The HTTP transport, sending each request to the endpoint `GitHubGraphQlAuth` chose for its host.
- * The middleware's span is the request's: the client's own would add `url.full`, which can carry
- * SHAs and branch names, so it is off, as for REST.
+ * The HTTP transport, sending each request to its target host's endpoint. Resolvers batch by this
+ * URL, so lookups for different hosts never share a request. `GitHubGraphQlAuth` requires the
+ * target, so every call has one. The middleware's span is the request's: the client's own would add
+ * `url.full`, which can carry SHAs and branch names, so it is off, as for REST.
  */
-const layerProtocol = GraphQLProtocol.layerHttp({ url: "https://api.github.com/graphql" }).pipe(
+const layerProtocol = GraphQLProtocol.layerHttp({
+  url: ({ context }) =>
+    GitHubApi.gitHubApiUrls(Context.getUnsafe(context, GitHubGraphQlTarget).host).graphql,
+}).pipe(
   Layer.provide(
     Layer.effect(
       HttpClient.HttpClient,
       Effect.gen(function* () {
         const client = yield* HttpClient.HttpClient;
-        return client.pipe(
-          HttpClient.mapRequestEffect((request) =>
-            Effect.gen(function* () {
-              const endpoint = yield* GraphQlEndpoint;
-              return endpoint === null ? request : HttpClientRequest.setUrl(request, endpoint);
-            }),
-          ),
-          HttpClient.transformResponse(
-            Effect.provideService(HttpClient.TracerDisabledWhen, () => true),
-          ),
+        return HttpClient.transformResponse(
+          client,
+          Effect.provideService(HttpClient.TracerDisabledWhen, () => true),
         );
       }),
     ),
@@ -231,12 +218,12 @@ const layerProtocol = GraphQLProtocol.layerHttp({ url: "https://api.github.com/g
 export const layer = Layer.merge(GitHubGraphQlAuth.layer, layerProtocol);
 
 /**
- * What decides which lookups may share one batched request: the host, and the credential and
- * rate-limit scope it will be sent under. Read from the context the lookup was made in.
+ * What decides which lookups to one host may share a batched request: the credential and
+ * rate-limit scope it will be sent under. Read from the context the lookup was made in. Resolvers
+ * already keep hosts apart, since they batch by the transport's URL too.
  */
 export const batchKey = (context: Context.Context<GitHubGraphQlTarget>) =>
   JSON.stringify([
-    Context.get(context, GitHubGraphQlTarget).host.toLowerCase(),
     Context.getOrElse(context, GitHubApi.PinnedGitHubCredential, () => null)
       ?.credentialFingerprint ?? null,
     Context.getOrElse(context, SourceControlRateLimit.CredentialScope, () => ""),
