@@ -6110,40 +6110,46 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
         const runtimeContext = yield* Effect.context<never>();
         const runPromise = Effect.runPromiseWith(runtimeContext);
 
+        // Overlays state the adapter owns per native session onto persisted provider metadata.
+        const withAdapterNativeMetadata = (
+          providerThread: OrchestrationV2ProviderThread,
+          nativeThreadId: string,
+        ): OrchestrationV2ProviderThread => {
+          const budget = pdfBudgets.get(nativeThreadId);
+          const hasAppliedTitle = appliedSessionTitles.has(nativeThreadId);
+          const recordedTitle = providerThread.nativeMetadata?.title;
+          if (budget === undefined && !hasAppliedTitle && recordedTitle === undefined) {
+            return providerThread;
+          }
+          return {
+            ...providerThread,
+            nativeMetadata: {
+              ...providerThread.nativeMetadata,
+              ...(budget === undefined
+                ? {}
+                : {
+                    claudeAttachmentBudget: {
+                      bytesUsed: budget.committed.bytes,
+                      pagesUsed: budget.committed.pages,
+                    },
+                  }),
+              // A cleared title makes the next turn after a restart retry a rename that failed.
+              ...(hasAppliedTitle
+                ? { title: normalizeClaudeSessionTitle(appliedSessionTitles.get(nativeThreadId)) }
+                : recordedTitle === undefined
+                  ? {}
+                  : { title: null }),
+            },
+          };
+        };
+
         const emitProviderEvent = (event: ProviderAdapter.ProviderAdapterV2Event) => {
           if (event.type === "provider_thread.updated") {
             const nativeThreadId = event.providerThread.nativeThreadRef?.nativeId ?? "";
-            const budget = pdfBudgets.get(nativeThreadId);
-            const appliedTitle = appliedSessionTitles.get(nativeThreadId);
-            const hasAppliedTitle = appliedSessionTitles.has(nativeThreadId);
-            if (
-              budget !== undefined ||
-              hasAppliedTitle ||
-              event.providerThread.nativeMetadata?.title !== undefined
-            ) {
-              event = {
-                ...event,
-                providerThread: {
-                  ...event.providerThread,
-                  nativeMetadata: {
-                    ...event.providerThread.nativeMetadata,
-                    ...(budget !== undefined
-                      ? {
-                          claudeAttachmentBudget: {
-                            bytesUsed: budget.committed.bytes,
-                            pagesUsed: budget.committed.pages,
-                          },
-                        }
-                      : {}),
-                    ...(hasAppliedTitle
-                      ? { title: normalizeClaudeSessionTitle(appliedTitle) }
-                      : event.providerThread.nativeMetadata?.title !== undefined
-                        ? { title: null }
-                        : {}),
-                  },
-                },
-              };
-            }
+            event = {
+              ...event,
+              providerThread: withAdapterNativeMetadata(event.providerThread, nativeThreadId),
+            };
             const nativeSessionId = clearedNativeSessions.get(nativeThreadId);
             if (nativeSessionId !== undefined) {
               event = {
@@ -6324,34 +6330,7 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
             if (nativeThreadId === undefined || nativeThreadId === null) {
               return;
             }
-            const budget = pdfBudgets.get(nativeThreadId);
-            const appliedTitle = appliedSessionTitles.get(nativeThreadId);
-            const hasAppliedTitle = appliedSessionTitles.has(nativeThreadId);
-            const enriched: OrchestrationV2ProviderThread = {
-              ...providerThread,
-              ...(budget !== undefined ||
-              hasAppliedTitle ||
-              providerThread.nativeMetadata?.title !== undefined
-                ? {
-                    nativeMetadata: {
-                      ...providerThread.nativeMetadata,
-                      ...(budget !== undefined
-                        ? {
-                            claudeAttachmentBudget: {
-                              bytesUsed: budget.committed.bytes,
-                              pagesUsed: budget.committed.pages,
-                            },
-                          }
-                        : {}),
-                      ...(hasAppliedTitle
-                        ? { title: normalizeClaudeSessionTitle(appliedTitle) }
-                        : providerThread.nativeMetadata?.title !== undefined
-                          ? { title: null }
-                          : {}),
-                    },
-                  }
-                : {}),
-            };
+            const enriched = withAdapterNativeMetadata(providerThread, nativeThreadId);
             yield* Ref.update(lastProviderThreadByNativeThread, (current) =>
               new Map(current).set(nativeThreadId, enriched),
             );
@@ -12928,36 +12907,23 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
                       Effect.provideService(Path.Path, path),
                     );
             const querySession = yield* openQuery(turnInput, nativeThreadId, queryPolicy);
-            // Send the CLI's rename so `claude --resume` follows the thread title.
-            // Turn startup bounds the call with a 10s timeout; on failure/timeout,
-            // invalidate the tracked title so retries re-apply earlier titles too.
+            // `claude --resume` shows the native title. A failed or timed-out rename forgets the
+            // applied title so the next turn, even after a restart, sends it again.
             if (appliedSessionTitles.get(nativeThreadId) !== turnInput.appThread.title) {
-              yield* querySession.query.renameSession(turnInput.appThread.title).pipe(
-                Effect.timeout("10 seconds"),
-                Effect.tap(() =>
-                  Effect.gen(function* () {
-                    appliedSessionTitles.set(nativeThreadId, turnInput.appThread.title);
-                    const remembered = (yield* Ref.get(lastProviderThreadByNativeThread)).get(
-                      nativeThreadId,
-                    );
-                    if (remembered !== undefined) {
-                      yield* rememberProviderThread(remembered);
-                    }
-                  }),
-                ),
-                Effect.tapError(() =>
-                  Effect.gen(function* () {
-                    appliedSessionTitles.delete(nativeThreadId);
-                    const remembered = (yield* Ref.get(lastProviderThreadByNativeThread)).get(
-                      nativeThreadId,
-                    );
-                    if (remembered !== undefined) {
-                      yield* rememberProviderThread(remembered);
-                    }
-                  }),
-                ),
-                Effect.ignore,
+              const renamed = yield* querySession.query
+                .renameSession(turnInput.appThread.title)
+                .pipe(Effect.timeout("10 seconds"), Effect.isSuccess);
+              if (renamed) {
+                appliedSessionTitles.set(nativeThreadId, turnInput.appThread.title);
+              } else {
+                appliedSessionTitles.delete(nativeThreadId);
+              }
+              const remembered = (yield* Ref.get(lastProviderThreadByNativeThread)).get(
+                nativeThreadId,
               );
+              if (remembered !== undefined) {
+                yield* rememberProviderThread(remembered);
+              }
             }
             const autoCompactWindow = yield* resolveAutoCompactWindow(
               querySession.settingsCwd,

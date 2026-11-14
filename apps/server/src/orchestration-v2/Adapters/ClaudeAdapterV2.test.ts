@@ -3831,46 +3831,6 @@ describe("ClaudeAdapterV2 background wake turns", () => {
       ),
     );
 
-    it.effect("retries a failed rename on the next turn", () =>
-      Effect.gen(function* () {
-        let attempts = 0;
-        const harness = yield* makeWakeHarnessWithOptions({
-          renameSession: () =>
-            ++attempts === 1
-              ? Effect.fail(
-                  new ClaudeAdapterV2.ClaudeAgentSdkQueryRunnerError({
-                    method: "renameSession",
-                    cause: new Error("rename refused"),
-                  }),
-                )
-              : Effect.void,
-        });
-        yield* startTurn(harness, "First title", 1, true);
-        yield* finishTurn(harness, 1);
-        assert.deepEqual(harness.renameCalls, ["First title"]);
-        assert.equal(attempts, 1);
-
-        yield* startTurn(harness, "First title", 2, true);
-        yield* finishTurn(harness, 2);
-        assert.deepEqual(harness.renameCalls, ["First title", "First title"]);
-        assert.equal(attempts, 2);
-
-        yield* startTurn(harness, "First title", 3, true);
-        yield* finishTurn(harness, 3);
-        assert.deepEqual(harness.renameCalls, ["First title", "First title"]);
-        assert.equal(attempts, 2);
-      }).pipe(
-        Effect.provide(
-          Layer.mergeAll(
-            IdAllocator.layer,
-            McpProviderSessions.layer,
-            NodeServices.layer,
-            NodeCrypto.layer,
-          ),
-        ),
-      ),
-    );
-
     it.effect(
       "a rename blocked past the deadline still offers the prompt and retries next turn",
       () =>
@@ -3955,7 +3915,6 @@ describe("ClaudeAdapterV2 background wake turns", () => {
       () =>
         Effect.gen(function* () {
           const harness = yield* makeWakeHarnessWithOptions({ freshQueueOnReopen: true });
-          // Turn 1 applies "First title" at spawn.
           yield* startTurn(harness, "First title", 1);
           assert.deepEqual(harness.renameCalls, []);
           yield* finishTurn(harness, 1);
@@ -3971,7 +3930,6 @@ describe("ClaudeAdapterV2 background wake turns", () => {
           assert.equal(lastEvent?.providerThread.nativeMetadata?.title, "First title");
           const threadAfterTurn1 = lastEvent!.providerThread;
 
-          // Recreate provider session runtime (e.g. server restart or session reconnect).
           const runtime2 = yield* harness.adapter.openSession({
             threadId: harness.threadId,
             providerSessionId: ProviderSessionId.make("provider-session-claude-wake-2"),
@@ -3994,13 +3952,10 @@ describe("ClaudeAdapterV2 background wake turns", () => {
           });
           assert.equal(resumedThread.nativeMetadata?.title, "First title");
 
-          // Resumed turn on recreated runtime with unchanged title "First title" must not send renameSession,
-          // preserving any native /rename that happened in the native CLI.
           yield* startTurn(harness, "First title", 2, true, runtime2, resumedThread);
           assert.deepEqual(harness.renameCalls, []);
           yield* finishTurn(harness, 2);
 
-          // If the thread title is subsequently changed to "Second title", it renames.
           yield* startTurn(harness, "Second title", 3, true, runtime2, resumedThread);
           assert.deepEqual(harness.renameCalls, ["Second title"]);
           yield* finishTurn(harness, 3);
